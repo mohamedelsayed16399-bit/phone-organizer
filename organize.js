@@ -7,7 +7,11 @@
  * Safety rules:
  *  - Never deletes anything. Files are only MOVED (and nothing is overwritten).
  *  - Default is a preview (dry run). Nothing moves until you confirm.
- *  - Every move is written to a log so `undo` can put everything back.
+ *  - A journal is opened and checked BEFORE anything moves. If it cannot be
+ *    written, nothing is moved. Each move is recorded (and flushed to disk)
+ *    BEFORE the file moves, so `undo` can always find it.
+ *  - A run only counts as undone when every file is back. Anything that failed
+ *    to restore stays in the journal, so running `undo` again retries it.
  */
 
 const fs = require('fs');
@@ -16,7 +20,7 @@ const os = require('os');
 const crypto = require('crypto');
 const readline = require('readline');
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const ORG = 'Organized';
 const DUPES_DIR = 'Duplicates-Review';
 
@@ -152,18 +156,22 @@ function uniquePath(p) {
   throw new Error('Could not find a free name for ' + p);
 }
 
-// Move without ever overwriting. Falls back to copy+verify when rename crosses drives.
-function safeMove(from, to, createdDirs) {
+// Work out where a move will land, and which folders it will have to create.
+function prepareMove(to) {
   const dir = path.dirname(to);
-  if (!fs.existsSync(dir)) {
-    // remember which directories we create so undo can remove the empty ones
-    let d = dir;
-    const chain = [];
-    while (!fs.existsSync(d)) { chain.push(d); d = path.dirname(d); }
-    fs.mkdirSync(dir, { recursive: true });
-    for (const c of chain) createdDirs.add(c);
+  const chain = [];
+  let d = dir;
+  while (!fs.existsSync(d)) { chain.push(d); d = path.dirname(d); }
+  return { dir, chain, final: uniquePath(to) };
+}
+
+// Move without ever overwriting. Falls back to copy+verify when rename crosses drives.
+function commitMove(from, prep, createdDirs) {
+  if (prep.chain.length) {
+    fs.mkdirSync(prep.dir, { recursive: true });
+    for (const c of prep.chain) createdDirs.add(c);
   }
-  const final = uniquePath(to);
+  const final = prep.final;
   try {
     fs.renameSync(from, final);
   } catch (e) {
@@ -175,6 +183,10 @@ function safeMove(from, to, createdDirs) {
     fs.unlinkSync(from); // only after a verified copy: this completes a move
   }
   return final;
+}
+
+function safeMove(from, to, createdDirs) {
+  return commitMove(from, prepareMove(to), createdDirs);
 }
 
 async function confirm(question, opts) {
@@ -189,44 +201,87 @@ async function confirm(question, opts) {
   return ans.trim().toLowerCase() === 'yes' || ans.trim().toLowerCase() === 'y';
 }
 
+// Legacy (v1.0) logs were one JSON file. Still read by undo.
 function writeLog(log, file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file + '.tmp', JSON.stringify(log, null, 1));
   fs.renameSync(file + '.tmp', file);
 }
 
-function newLog(kind, root) {
-  const file = path.join(homeDir(), 'logs', `${stamp()}-${kind}.json`);
-  return { file, log: { version: VERSION, kind, createdAt: new Date().toISOString(), root, undone: false, moves: [], createdDirs: [] } };
+// Journal: append-only JSON lines, each line flushed to disk before we go on.
+// Throws if the line could not be written.
+class Journal {
+  constructor(file) { this.file = file; this.fd = null; }
+  open(header) {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    this.fd = fs.openSync(this.file, 'wx');
+    this.add(header);
+  }
+  add(entry) {
+    fs.writeSync(this.fd, JSON.stringify(entry) + '\n');
+    fs.fsyncSync(this.fd);
+  }
+  close() { try { if (this.fd !== null) fs.closeSync(this.fd); } catch (_) { /* ignore */ } this.fd = null; }
 }
 
-// run a list of planned moves with a log that is always saved (also on Ctrl+C)
+function openJournal(kind, root) {
+  const file = path.join(homeDir(), 'logs', `${stamp()}-${process.pid}-${kind}.jsonl`);
+  const j = new Journal(file);
+  j.open({ t: 'header', version: VERSION, kind, createdAt: new Date().toISOString(), root });
+  return j;
+}
+
+// run a list of planned moves. The journal must be writable first; every move
+// is journaled before it happens (also safe on Ctrl+C)
 function execute(plan, kind, root) {
-  const { file, log } = newLog(kind, root);
+  let j;
+  try {
+    j = openJournal(kind, root);
+  } catch (e) {
+    console.error(`Cannot save the undo journal (${e.code || e.message}).`);
+    console.error('Nothing was moved, because a move could not be undone without it.');
+    return { done: 0, failed: 0, file: null, aborted: true };
+  }
   const created = new Set();
   let stop = false;
   const onInt = () => { stop = true; };
   process.on('SIGINT', onInt);
-  let done = 0, failed = 0;
+  let done = 0, failed = 0, aborted = false;
   try {
+    let id = 0;
     for (const m of plan) {
       if (stop) { console.log('Stopped early. Moves so far are saved and can be undone.'); break; }
+      let prep;
       try {
-        const final = safeMove(m.from, m.to, created);
-        log.moves.push({ from: m.from, to: final });
+        prep = prepareMove(m.to);
+      } catch (e) {
+        failed++;
+        console.log(`  skipped (${e.code || e.message}): ${path.basename(m.from)}`);
+        continue;
+      }
+      id++;
+      try {
+        // record the intent first: if the journal fails, this file does not move
+        j.add({ t: 'intent', id, from: m.from, to: prep.final, dirs: prep.chain });
+      } catch (e) {
+        aborted = true;
+        console.error(`\nStopped: the undo journal can no longer be written (${e.code || e.message}). No more files will be moved.`);
+        break;
+      }
+      try {
+        commitMove(m.from, prep, created);
         done++;
+        try { j.add({ t: 'done', id }); } catch (_) { /* intent is already saved; undo checks the real state */ }
       } catch (e) {
         failed++;
         console.log(`  skipped (${e.code || e.message}): ${path.basename(m.from)}`);
       }
-      if (done % 25 === 0) { log.createdDirs = [...created]; writeLog(log, file); }
     }
   } finally {
     process.removeListener('SIGINT', onInt);
-    log.createdDirs = [...created];
-    if (log.moves.length) writeLog(log, file);
+    j.close();
   }
-  return { done, failed, file: log.moves.length ? file : null };
+  return { done, failed, file: j.file, aborted };
 }
 
 // ---------- commands ----------
@@ -284,8 +339,10 @@ async function cmdOrganize(opts) {
     return;
   }
   const r = execute(plan, 'organize', root);
-  console.log(`\nDone. Moved ${r.done} files${r.failed ? `, ${r.failed} skipped` : ''}.`);
-  if (r.file) console.log('To undo:  node organize.js undo');
+  if (r.aborted && !r.done) { process.exitCode = 1; return; }
+  console.log(`\n${r.aborted ? 'Stopped early. ' : ''}Done. Moved ${r.done} files${r.failed ? `, ${r.failed} skipped` : ''}.`);
+  if (r.done) console.log('To undo:  node organize.js undo');
+  if (r.aborted) process.exitCode = 1;
 }
 
 function hashFile(f) {
@@ -365,8 +422,10 @@ async function cmdDupes(opts) {
   const plan = [];
   for (const g of groups) for (const e of g.extra) plan.push({ from: e.f, to: path.join(dest, path.basename(e.f)) });
   const r = execute(plan, 'dupes', root);
-  console.log(`Done. Moved ${r.done} extra copies. Look through ${path.relative(root, dest)} and delete them yourself when you are sure.`);
-  console.log('To undo:  node organize.js undo');
+  if (r.aborted && !r.done) { process.exitCode = 1; return; }
+  console.log(`${r.aborted ? 'Stopped early. ' : ''}Done. Moved ${r.done} extra copies. Look through ${path.relative(root, dest)} and delete them yourself when you are sure.`);
+  if (r.done) console.log('To undo:  node organize.js undo');
+  if (r.aborted) process.exitCode = 1;
 }
 
 function cmdBig(opts) {
@@ -388,7 +447,7 @@ function cmdBig(opts) {
 function listLogs() {
   const dir = path.join(homeDir(), 'logs');
   if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort().map((f) => path.join(dir, f));
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.json') || f.endsWith('.jsonl')).sort().map((f) => path.join(dir, f));
 }
 
 function rmdirIfEmpty(d, stopAt) {
@@ -398,36 +457,100 @@ function rmdirIfEmpty(d, stopAt) {
   }
 }
 
+// Read a log into { entries: [{id, from, to, state}], dirs, root, kind, createdAt, undone }.
+// state: 'moved' (or unknown) | 'restored' | 'gone'. Unreadable lines are skipped.
+function loadLog(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  if (file.endsWith('.json')) {
+    const l = JSON.parse(text);
+    return { legacy: true, raw: l, root: l.root, kind: l.kind, createdAt: l.createdAt, undone: !!l.undone,
+      dirs: l.createdDirs || [], entries: (l.moves || []).map((m, i) => ({ id: i + 1, from: m.from, to: m.to, state: 'moved' })) };
+  }
+  const out = { legacy: false, root: null, kind: '?', createdAt: '?', undone: false, dirs: [], entries: [] };
+  const byId = new Map();
+  let sawHeader = false;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let r;
+    try { r = JSON.parse(line); } catch (_) { continue; }
+    if (r.t === 'header') { sawHeader = true; out.root = r.root; out.kind = r.kind; out.createdAt = r.createdAt; }
+    else if (r.t === 'intent') {
+      const e = { id: r.id, from: r.from, to: r.to, state: 'moved' };
+      byId.set(r.id, e); out.entries.push(e);
+      for (const d of r.dirs || []) out.dirs.push(d);
+    } else if ((r.t === 'restored' || r.t === 'gone') && byId.has(r.id)) byId.get(r.id).state = r.t;
+    else if (r.t === 'undone') out.undone = true;
+  }
+  if (!sawHeader) throw new Error('not a journal');
+  return out;
+}
+
 async function cmdUndo(opts) {
   let files = listLogs();
   if (opts.log) files = [path.resolve(opts.log)];
   let file = null, log = null;
   for (const f of files.reverse()) {
     try {
-      const l = JSON.parse(fs.readFileSync(f, 'utf8'));
-      if (!l.undone) { file = f; log = l; break; }
+      const l = loadLog(f);
+      if (!l.undone && l.entries.some((e) => e.state === 'moved')) { file = f; log = l; break; }
     } catch (_) { /* skip broken log */ }
   }
   if (!log) { console.log('Nothing to undo.'); return; }
-  console.log(`Last run: ${log.kind} on ${log.createdAt} (${log.moves.length} files moved)`);
+  const pending = log.entries.filter((e) => e.state === 'moved');
+  console.log(`Last run: ${log.kind} on ${log.createdAt} (${pending.length} files to put back)`);
   if (!(await confirm('Put all those files back where they were?', opts))) { console.log('Nothing was changed.'); return; }
-  let back = 0, missing = 0, renamed = 0;
+  let jr = null;
+  if (!log.legacy) {
+    try { jr = new Journal(file); jr.fd = fs.openSync(file, 'a'); } catch (e) {
+      console.log(`Note: cannot write to the journal (${e.code || e.message}); files will still be restored, but a retry may re-check them.`);
+    }
+  }
+  const mark = (e, t) => { e.state = t; if (jr) { try { jr.add({ t, id: e.id }); } catch (_) { /* state is re-checked from disk on retry */ } } };
+  let back = 0, missing = 0, renamed = 0, errors = 0, ambiguous = 0;
   const created = new Set();
-  for (const m of log.moves.slice().reverse()) {
-    if (!fs.existsSync(m.to)) { missing++; continue; }
+  const forget = opts.flags.has('forget-missing');
+  for (const m of pending.slice().reverse()) {
+    const toThere = fs.existsSync(m.to);
+    const fromThere = fs.existsSync(m.from);
+    if (!toThere) {
+      if (fromThere) { mark(m, 'restored'); continue; } // the move never happened, or it is already back
+      if (forget) { mark(m, 'gone'); continue; }
+      missing++; continue;
+    }
+    if (fromThere && !log.legacy) {
+      // both exist: an interrupted cross-drive copy. Do not guess, do not touch.
+      const a = fs.statSync(m.to), b = fs.statSync(m.from);
+      if (a.size === b.size) { ambiguous++; console.log(`  left alone (the file exists in both places, check by hand): ${m.to}`); continue; }
+    }
     try {
       const target = uniquePath(m.from);
       if (target !== m.from) renamed++;
       safeMove(m.to, target, created);
+      mark(m, 'restored');
       back++;
     } catch (e) {
+      errors++;
       console.log(`  could not restore ${path.basename(m.to)}: ${e.code || e.message}`);
     }
   }
   // clean up empty folders that this tool created (never non-empty ones)
-  for (const d of (log.createdDirs || []).sort((a, b) => b.length - a.length)) rmdirIfEmpty(d, log.root);
-  if (missing === 0) { log.undone = true; log.undoneAt = new Date().toISOString(); writeLog(log, file); }
-  console.log(`Restored ${back} files.${missing ? ` ${missing} not found (you moved or removed them yourself); run undo again if needed.` : ''}${renamed ? ` ${renamed} got a (1) suffix because the original name was taken.` : ''}`);
+  for (const d of [...new Set(log.dirs)].sort((a, b) => b.length - a.length)) rmdirIfEmpty(d, log.root);
+  const left = log.entries.filter((e) => e.state === 'moved').length;
+  if (left === 0) {
+    if (log.legacy) { log.raw.undone = true; log.raw.undoneAt = new Date().toISOString(); writeLog(log.raw, file); }
+    else if (jr) { try { jr.add({ t: 'undone', at: new Date().toISOString() }); } catch (_) { /* ignore */ } }
+  } else if (log.legacy) {
+    // keep only what is still unresolved, so a retry picks up exactly those
+    log.raw.moves = log.entries.filter((e) => e.state === 'moved').map((e) => ({ from: e.from, to: e.to }));
+    try { writeLog(log.raw, file); } catch (_) { /* original log is left untouched */ }
+  }
+  if (jr) jr.close();
+  console.log(`Restored ${back} files.${renamed ? ` ${renamed} got a (1) suffix because the original name was taken.` : ''}`);
+  if (left) {
+    console.log(`${left} file(s) are NOT restored yet${errors ? ` (${errors} errors)` : ''}${missing ? ` (${missing} not found: moved or removed by you?)` : ''}${ambiguous ? ` (${ambiguous} need a manual look)` : ''}. They are still in the journal: run undo again to retry.`);
+    if (missing) console.log('If those files are gone for good, run:  node organize.js undo --forget-missing');
+    process.exitCode = 1;
+  }
 }
 
 function help() {
@@ -439,7 +562,7 @@ Commands:
   organize   (default) sort files into Organized/<Type>/<Year-Month>. Preview first.
   dupes      find exact duplicate files. Add --move-dupes to gather extra copies for review.
   big        list the biggest files on the phone (read-only).
-  undo       put back everything moved by the last run.
+  undo       put back everything moved by the last run (run again to retry any that failed).
 
 Options:
   --folder NAME   folder inside phone storage (default: Download). Can repeat.
@@ -468,4 +591,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error('ERROR: ' + (e && e.message ? e.message : e)); process.exit(1); });
-module.exports = { categoryOf, dateOf, planOrganize, findDupes };
+module.exports = { categoryOf, dateOf, planOrganize, findDupes, execute, cmdUndo, parseArgs };
